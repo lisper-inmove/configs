@@ -1,0 +1,59 @@
+{
+    "workbench.colorTheme": "One Dark Pro Darker",
+    "window.zoomLevel": 2,
+    "extensions.ignoreRecommendations": true,
+
+    // C++ settings for formatting
+    "[cpp]": {
+        "editor.defaultFormatter": "xaver.clang-format",
+        "editor.formatOnSave": true, // Auto format on save
+        "editor.tabSize": 4, // Set tab size to 4 spaces
+        "editor.insertSpaces": true, // Use spaces instead of tabs
+        "editor.rulers": [120], // Show ruler at 80 characters for line length
+        "editor.detectIndentation": false // Disable automatic indentation detection
+    },
+
+    // C/C++ settings
+    "C_Cpp.intelliSenseEngine": "default", // Default IntelliSense engine
+    "C_Cpp.default.compilerPath": "/usr/bin/g++", // Specify the path to your C++ compiler (adjust for your system)
+    "C_Cpp.default.includePath": [
+        "/usr/include/c++/12",
+        "/usr/include/x86_64-linux-gnu/c++/12",
+        "/usr/local/include",
+        "/usr/include"
+    ],
+
+    // Enable file-specific settings
+    "files.autoSave": "onWindowChange", // Auto-save files when window loses focus
+    "files.trimTrailingWhitespace": true, // Remove trailing whitespace on save
+    "files.insertFinalNewline": true, // Ensure file ends with a newline
+
+    // Enable linters and formatters
+    "clang-format.executable": "/usr/bin/clang-format", // Path to clang-format (adjust for your system)
+    // "clang-format.style": "Google", // Optionally set style, e.g., "Google", "LLVM", etc.
+    "clang-format.style": "file", // Use .clang-format file settings
+
+    // Enable error squiggles and suggestions
+    "C_Cpp.errorSquiggles": "enabled", // Enable error squiggles
+    "C_Cpp.formatting": "clangFormat", // Use clang-format for C++ formatting
+
+    // Miscellaneous helpful settings
+    "editor.renderWhitespace": "all", // Show all whitespace characters
+    "editor.minimap.enabled": false, // Disable minimap if you prefer more space for code
+    "editor.wordWrap": "on", // Wrap lines to the editor's width
+    "editor.lineHeight": 22, // Adjust line height to make code more readable
+
+    // Git integration (optional, if you're using Git)
+    "git.enabled": true,
+    "git.autofetch": true,
+    "git.confirmSync": false,
+
+    // Auto-suggest and autocompletion
+    "editor.quickSuggestions": {
+        "other": true,
+        "comments": true,
+        "strings": true
+    },
+    "editor.parameterHints.enabled": true
+}
+
