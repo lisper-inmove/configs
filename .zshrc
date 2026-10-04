@@ -215,3 +215,28 @@ export PATH=/usr/local/cuda-13.0/bin:$PATH
 # export C_INCLUDE_PATH=/usr/local/cuda-13.0/include:$C_INCLUDE_PATH
 # export CPLUS_INCLUDE_PATH=/usr/local/cuda-13.0/include:$CPLUS_INCLUDE_PATH
 ###############################################################################################################
+
+
+makef() {
+    local targets=$(make -pRrq : 2>/dev/null | awk -v RS= -F: '/^# File/,/^# Finished Make data base/ {if ($1 !~ "^[#.]") {print $1}}' | egrep -v '^[^[:alnum:]]' | sort -u)
+    
+    # 如果没有找到目标，则提示并返回
+    if [[ -z "$targets" ]]; then
+        echo "未在 Makefile 中找到任何目标。"
+        return 1
+    fi
+    
+    # 将目标列表传递给 fzf 进行选择
+    local selected=$(echo "$targets" | fzf --height 40% --reverse --prompt="选择 make 目标 > ")
+    
+    # 如果用户选择了目标，则执行 make
+    if [[ -n "$selected" ]]; then
+        # 将选择的命令放入缓冲区，方便你确认后执行
+        LBUFFER="make $selected"
+        zle reset-prompt
+    fi
+}
+# 创建一个 zsh 小部件并绑定到快捷键（例如 Ctrl-M）
+zle -N makef
+bindkey '^[m' makef  # Alt+M
+
