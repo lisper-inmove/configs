@@ -14,15 +14,30 @@
 # NETPROXY_MODE:
 #   forward （默认）  -R 端口映射到 A 上的固定代理端口（稳妥，需要 A 上有代理在监听）
 #   dynamic           -R 不指定目标，由 sshd 直接当 SOCKS（A 上没有代理时可用）
+#
+# 角色（NETPROXY_ROLE）：
+#   a      A 侧发起方，netproxy up 把 A 的代理推到 B
+#   b      B 侧被动方，只用 status/env/run/test
+#   relay  B 作为中转，把本机已有的代理端口再接力给第三方机器（链式）
+#          配置：NETPROXY_PEER / NETPROXY_LOCAL_PORT / NETPROXY_UPSTREAM_LOCAL_PORT
 set -uo pipefail
 
-VERSION="2.0"   # 2.0: 支持 forward/dynamic 双模式；旧版只有 dynamic
+VERSION="2.1"   # 2.1: 新增 relay 角色（B 为中转，把代理接力给第三台机器）；2.0: forward/dynamic 双模式
 
 CONFIG_FILE="${NETPROXY_CONFIG:-$HOME/.config/netproxy/config}"
+
+# 命令行/环境变量优先于配置文件：
+# 先记下已有的 NETPROXY_*，source 配置后再恢复，避免配置文件把它们覆盖掉。
+declare -A _ENV_OVERRIDE=()
+while IFS= read -r _k; do
+  [[ "$_k" == NETPROXY_* ]] && _ENV_OVERRIDE[$_k]="${!_k}"
+done < <(compgen -v)
 # shellcheck source=/dev/null
 [ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+for _k in "${!_ENV_OVERRIDE[@]}"; do export "$_k=${_ENV_OVERRIDE[$_k]}"; done
+unset _k
 
-ROLE="${NETPROXY_ROLE:-auto}"                     # auto | a | b
+ROLE="${NETPROXY_ROLE:-auto}"                     # auto | a | b | relay
 PEER="${NETPROXY_PEER:-}"                         # 对端地址（A 上是 B 的地址）
 PEER_USER="${NETPROXY_PEER_USER:-$USER}"
 PEER_PORT="${NETPROXY_PEER_PORT:-22}"
@@ -31,18 +46,22 @@ LOCAL_PORT="${NETPROXY_LOCAL_PORT:-17891}"        # B 上监听的端口
 SOCKS_BIND="${NETPROXY_SOCKS_BIND:-127.0.0.1}"    # 只绑定回环，不给局域网用
 MODE="${NETPROXY_MODE:-forward}"                  # forward | dynamic
 UPSTREAM_PORT="${NETPROXY_UPSTREAM_PORT:-7897}"   # A 侧代理端口（forward 模式）
+UPSTREAM_LOCAL_PORT="${NETPROXY_UPSTREAM_LOCAL_PORT:-17891}"  # relay 模式：本机已有的代理端口
 PROXY_SCHEME="${NETPROXY_PROXY_SCHEME:-socks5h}"  # socks5h | http
 PROXY_URL="${NETPROXY_PROXY_URL:-$PROXY_SCHEME://127.0.0.1:$LOCAL_PORT}"
 # 注意：curl 7.68 不支持 no_proxy 里的 CIDR 写法（10.0.0.0/8 会被忽略），
 # 所以这里列的是具体地址/后缀。内网段需要自己加。
 NO_PROXY_LIST="${NETPROXY_NO_PROXY:-localhost,127.0.0.1,::1,.local,10.100.129.13,10.100.129.0}"
 
+# relay 角色用独立的 pid/日志，避免和主隧道互相干扰
+SUFFIX=""
+[ "$ROLE" = relay ] && SUFFIX="-relay"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/netproxy"
-PID_FILE="$STATE_DIR/supervisor.pid"
-SSH_PID_FILE="$STATE_DIR/ssh.pid"
-STOP_FILE="$STATE_DIR/stop"
-ENV_FILE="$STATE_DIR/env"
-LOG_FILE="$STATE_DIR/netproxy.log"
+PID_FILE="$STATE_DIR/supervisor$SUFFIX.pid"
+SSH_PID_FILE="$STATE_DIR/ssh$SUFFIX.pid"
+STOP_FILE="$STATE_DIR/stop$SUFFIX"
+ENV_FILE="$STATE_DIR/env$SUFFIX"
+LOG_FILE="$STATE_DIR/netproxy$SUFFIX.log"
 
 SSH_OPTS=(
   -N
@@ -63,18 +82,24 @@ log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE"; }
 say() { printf '%s\n' "$*"; }
 die() { printf 'netproxy: %s\n' "$*" >&2; exit 1; }
 
-port_open() {
+port_open() { port_open_local "$LOCAL_PORT"; }
+
+port_open_local() {
   # 用 bash 的 /dev/tcp；偶发 EADDRINUSE 时重试一次，避免误报"未就绪"
-  local i
+  local p="${1:-$LOCAL_PORT}" i
   for i in 1 2 3; do
-    (exec 3<>"/dev/tcp/127.0.0.1/$LOCAL_PORT") 2>/dev/null && return 0
+    (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null && return 0
     sleep 0.2
   done
   return 1
 }
 pid_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 read_pid() { [ -r "$1" ] && head -n1 "$1" 2>/dev/null; }
-is_up() { pid_alive "$(read_pid "$PID_FILE")" && port_open; }
+# relay 角色的监听在下游机器上，本机看不到端口，只能凭进程判断
+is_up() {
+  local pid; pid="$(read_pid "$PID_FILE")"
+  if [ "$ROLE" = relay ]; then pid_alive "$pid"; else pid_alive "$pid" && port_open; fi
+}
 
 host_has_ip() {
   local want="$1" addrs a
@@ -104,6 +129,7 @@ wait_port() {
 }
 
 write_env() {
+  mkdir -p "$STATE_DIR"
   cat >"$ENV_FILE" <<EOF
 export http_proxy="$PROXY_URL"
 export https_proxy="$PROXY_URL"
@@ -123,8 +149,11 @@ peer_ssh_ok() {
 # ---------------------------------------------------------------- A 侧：反向隧道
 # forward 模式：把 A 本地的代理端口映射到 B 的回环；dynamic 模式：sshd 直接当 SOCKS
 remote_spec() {
-  if [ "$MODE" = dynamic ]; then
+  if [ "$MODE" = dynamic ] && [ "$ROLE" != relay ]; then
     printf '%s:%s' "$SOCKS_BIND" "$LOCAL_PORT"
+  elif [ "$ROLE" = relay ]; then
+    # B 是中转：把本机已有的代理端口转发给下游机器
+    printf '%s:%s:127.0.0.1:%s' "$SOCKS_BIND" "$LOCAL_PORT" "$UPSTREAM_LOCAL_PORT"
   else
     printf '%s:%s:127.0.0.1:%s' "$SOCKS_BIND" "$LOCAL_PORT" "$UPSTREAM_PORT"
   fi
@@ -151,10 +180,17 @@ supervise() {
 }
 
 cmd_up() {
-  [ "$(detect_role)" = a ] || die "这个命令要在 A 上运行（A 是发起方）。
-  · 本机判定为 B（配置里的对端是 \"$PEER\"）
+  case "$(detect_role)" in
+    a|relay) ;;
+    *) die "这个命令是本机作为发起方时用的（角色 a 或 relay），当前判定为 b。
   · B 侧只需 netproxy status / netproxy env"
-  [ -n "$PEER" ] || die "未配置 NETPROXY_PEER（B 的地址）。见 netproxy install"
+       ;;
+  esac
+  [ -n "$PEER" ] || die "未配置 NETPROXY_PEER（下游机器地址）。见 netproxy install"
+  if [ "$ROLE" = relay ]; then
+    port_open_local "$UPSTREAM_LOCAL_PORT" ||
+      die "本机的 $UPSTREAM_LOCAL_PORT 没有监听 —— 先把主隧道开起来（A 上 netproxy up）"
+  fi
   mkdir -p "$STATE_DIR"
   if is_up; then say "已经在运行（127.0.0.1:$LOCAL_PORT）"; return 0; fi
 
@@ -185,13 +221,19 @@ cmd_up() {
     cmd_down >/dev/null 2>&1
     return 1
   fi
-  if [ "$MODE" = dynamic ]; then
+  if [ "$MODE" = dynamic ] && [ "$ROLE" != relay ]; then
     say "已开启：B 的 $SOCKS_BIND:$LOCAL_PORT 是 sshd 直拨的 SOCKS5（出口经 $PEER_USER@$PEER）"
+  elif [ "$ROLE" = relay ]; then
+    say "已开启：$PEER 的 $SOCKS_BIND:$LOCAL_PORT  ->  本机 127.0.0.1:$UPSTREAM_LOCAL_PORT"
+    say "下游验证： ssh $PEER_USER@$PEER 'curl -x $PROXY_URL https://www.google.com.hk'"
   else
     say "已开启：B 的 $SOCKS_BIND:$LOCAL_PORT  ->  A 的 127.0.0.1:$UPSTREAM_PORT（经 $PEER_USER@$PEER）"
   fi
   say "代理地址：$PROXY_URL"
-  say "在 B 上验证： netproxy status ； netproxy env"
+  case "$ROLE" in
+    relay) say "下游机器上用： $PROXY_URL" ;;
+    *)     say "在 B 上验证： netproxy status ； netproxy env" ;;
+  esac
 }
 
 cmd_down() {
@@ -219,6 +261,21 @@ cmd_status() {
   local role; role="$(detect_role)"
   local desc="$PROXY_URL ($MODE 模式)"
   [ "$MODE" = forward ] && desc="$PROXY_URL  ->  upstream :$UPSTREAM_PORT  (forward 模式)"
+
+  if [ "$ROLE" = relay ]; then
+    # 中继端口在下游机器上，本机只能看进程状态
+    if is_up; then
+      say "状态      : 运行中（中继到 $PEER_USER@$PEER:$LOCAL_PORT）"
+      say "上游      : 本机 127.0.0.1:$UPSTREAM_LOCAL_PORT"
+      say "下游地址  : $PROXY_URL"
+      pid_alive "$(read_pid "$SSH_PID_FILE")" && say "ssh 进程  : $(read_pid "$SSH_PID_FILE")"
+      return 0
+    fi
+    say "状态      : 未运行（中继未启动）"
+    say "提示      : 在本机执行 netproxy up（角色 relay），需先在 A 上开主隧道"
+    return 1
+  fi
+
   if port_open; then
     say "状态      : 运行中（本机 $LOCAL_PORT 可连接）"
     say "代理地址  : $desc"
@@ -332,7 +389,7 @@ cmd_version() {
   # 旧版没有 MODE 变量，且 up 的输出文案不同——据此判断对端是否更新过
 }
 
-usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 && !/^#/ {exit} NR==1 && /^#!/ {next}' "$0"; }
 
 case "${1:-}" in
   up)          cmd_up ;;

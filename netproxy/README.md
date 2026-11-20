@@ -1,4 +1,4 @@
-# netproxy — 让不能上网的 B 借用能上网的 A 的网络
+# netproxy — 让不能上网的机器借用 A 的网络
 
 ## 拓扑
 
@@ -9,12 +9,26 @@ A（另一台 VMware 虚拟机，能上网，跑着 clash :7897）
    ▼
 B（本机，10.100.129.13，VMware 虚拟机，无公网、无可用 DNS）
    127.0.0.1:17891  ←── ssh 隧道 ──→  A 的 127.0.0.1:7897
+   │
+   │  relay（链式接力，可选）
+   ▼
+C（10.100.129.21，同样无公网）
+   127.0.0.1:17892  ←── ssh -R（由 B 发起）──→  B 的 127.0.0.1:17891
 ```
 
 因为 **B 无法主动连 A**，所以：
 
-- **A 是发起方**，开关都在 A 上（`netproxy up` / `netproxy down`）
-- **B 是被动方**，只用 `netproxy status` / `env` / `run` / `test`
+- **A 是发起方**，主隧道的开关在 A 上（`netproxy up` / `netproxy down`）
+- **B 是被动方**，用 `netproxy status` / `env` / `run` / `test`
+- **C 通过 B 中继**，B 用 `relay` 角色主动连 C（B→C 方向可达）
+
+## 角色一览
+
+| 角色 | 跑在哪 | 做什么 | 开关 |
+|---|---|---|---|
+| `a` | A | `ssh -R` 把 A 的 clash 端口推到 B | `netproxy up/down`（在 A 上） |
+| `b` | B / C | 被动使用 `127.0.0.1:<port>` | 由上游控制 |
+| `relay` | B | 把 B 已有的代理端口再接力给 C | `netproxy up/down`（在 B 上，独立配置文件） |
 
 ## 两种模式
 
@@ -172,6 +186,77 @@ git ls-remote origin                      # 能列出分支即可
 > `nc` 必须是 OpenBSD netcat（支持 `-X 5 -x`）。若换成 nmap-ncat，
 > 参数要改成 `--proxy-type socks5 --proxy 127.0.0.1:17891`。
 
+## 第三台机器：链式中继（relay）
+
+如果还有一台 **C（10.100.129.21）** 也需要借 A 的网，而 **C 也不能主动连 A**、
+但 **B 能主动连 C**，就在 B 上做一次接力：
+
+```
+A ──ssh -R──► B:17891 ──ssh -R(relay)──► C:17892
+```
+
+### B 侧配置（独立文件，不动主配置）
+
+```bash
+# ~/.config/netproxy/relay.conf
+NETPROXY_ROLE=relay
+NETPROXY_PEER=10.100.129.21        # C 的地址
+NETPROXY_PEER_USER=JC1136
+NETPROXY_PEER_PORT=22
+NETPROXY_LOCAL_PORT=17892          # C 上要监听的端口
+NETPROXY_UPSTREAM_LOCAL_PORT=17891 # B 上已有的代理端口（由 A 的主隧道提供）
+```
+
+用独立配置文件，避免和主隧道共享 pid/日志：
+
+```bash
+NETPROXY_CONFIG=~/.config/netproxy/relay.conf netproxy up      # 开启
+NETPROXY_CONFIG=~/.config/netproxy/relay.conf netproxy status
+NETPROXY_CONFIG=~/.config/netproxy/relay.conf netproxy down    # 关闭
+```
+
+`up` 会先检查 B 上的 `17891` 是否存在，没有就拒绝启动并提示先开主隧道。
+relay 的 pid/日志带 `-relay` 后缀（`ssh-relay.pid` / `netproxy-relay.log`），
+与主隧道互不影响。
+
+前置条件：**B 必须能免密 SSH 到 C**（`BatchMode=yes`，不能交互输密码）。
+
+### C 侧
+
+```bash
+install -Dm755 netproxy ~/.bin/netproxy
+# ~/.config/netproxy/config
+NETPROXY_ROLE=b
+NETPROXY_LOCAL_PORT=17892
+NETPROXY_PROXY_SCHEME=socks5h
+
+netproxy status      # 应显示运行中
+netproxy run curl -I https://www.google.com.hk
+```
+
+C 上的 `~/.ssh/config` 也要配 ProxyCommand（端口改成 17892），否则 `git`
+走 SSH 时同样会因 DNS/网络不通而失败：
+
+```
+Host github.com
+  Hostname ssh.github.com
+  Port 443
+  ProxyCommand /home/JC1136/.ssh/github-proxy %h %p
+```
+
+### relay 已验证
+
+| 检查 | 结果 |
+|---|---|
+| C 的 `127.0.0.1:17892` 监听 | ✅ |
+| google.com.hk / github / pypi 经 C 访问 | 200 / 200 / 200 |
+| 出口 IP | 美国 fdcservers（与 A 的 clash 一致） |
+| 幂等 up、`down` 后 C 端口清理 | ✅ |
+| 杀掉 ssh 子进程后自动重连（C 端口 2 秒内恢复） | ✅ |
+| 上游 17891 不存在时拒绝启动 | ✅ |
+| C 上 `netproxy run` / `env` / `test` | ✅ |
+| C 上 `ssh -T git@github.com` | ✅ `Hi lisper-inmove!` |
+
 ## 实测结果（2026-11-20，forward 模式）
 
 ```
@@ -228,3 +313,13 @@ git config --global --unset url.https://ghfast.top/https://github.com/.insteadOf
 （B 当前已无此配置。）
 
 **SSH 不读 `http_proxy`。** 详见上文「让 SSH / git 也走隧道」。
+
+**环境变量优先于配置文件。** `NETPROXY_*=...` 写在命令前面会覆盖配置文件里的同名项，
+临时改端口不用编辑文件：
+
+```bash
+NETPROXY_LOCAL_PORT=17893 netproxy up
+```
+
+**relay 模式用独立配置文件。** 同一个 `~/.config/netproxy/*.conf` 只能有一种角色，
+所以中继要单独一份并通过 `NETPROXY_CONFIG` 指向它。
