@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+# netproxy — 让不能上网的 B（本机）借用能上网的 A 的网络
+#
+# 拓扑前提：
+#   A 能主动 SSH 到 B；B 不能主动连 A。
+#   所以由 A 反向建立隧道，把它本地的 sockd/clash 端口（默认 7897）
+#   映射到 B 的 127.0.0.1:17891，B 上的程序指向该端口即可借用 A 的出网口。
+#
+# 这个脚本装在两台机器上都能用：
+#   A 上：netproxy up      反向隧道常驻（A 是发起方，必须在这里跑）
+#   B 上：netproxy status  看端口在不在；netproxy env 取环境变量
+#         netproxy on/off   只是给提示，真正开关在 A 上
+#
+# NETPROXY_MODE:
+#   forward （默认）  -R 端口映射到 A 上的固定代理端口（稳妥，需要 A 上有代理在监听）
+#   dynamic           -R 不指定目标，由 sshd 直接当 SOCKS（A 上没有代理时可用）
+set -uo pipefail
+
+VERSION="2.0"   # 2.0: 支持 forward/dynamic 双模式；旧版只有 dynamic
+
+CONFIG_FILE="${NETPROXY_CONFIG:-$HOME/.config/netproxy/config}"
+# shellcheck source=/dev/null
+[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+ROLE="${NETPROXY_ROLE:-auto}"                     # auto | a | b
+PEER="${NETPROXY_PEER:-}"                         # 对端地址（A 上是 B 的地址）
+PEER_USER="${NETPROXY_PEER_USER:-$USER}"
+PEER_PORT="${NETPROXY_PEER_PORT:-22}"
+IDENTITY="${NETPROXY_IDENTITY:-}"                 # A 登录 B 用的私钥（留空则用默认）
+LOCAL_PORT="${NETPROXY_LOCAL_PORT:-17891}"        # B 上监听的端口
+SOCKS_BIND="${NETPROXY_SOCKS_BIND:-127.0.0.1}"    # 只绑定回环，不给局域网用
+MODE="${NETPROXY_MODE:-forward}"                  # forward | dynamic
+UPSTREAM_PORT="${NETPROXY_UPSTREAM_PORT:-7897}"   # A 侧代理端口（forward 模式）
+PROXY_SCHEME="${NETPROXY_PROXY_SCHEME:-socks5h}"  # socks5h | http
+PROXY_URL="${NETPROXY_PROXY_URL:-$PROXY_SCHEME://127.0.0.1:$LOCAL_PORT}"
+# 注意：curl 7.68 不支持 no_proxy 里的 CIDR 写法（10.0.0.0/8 会被忽略），
+# 所以这里列的是具体地址/后缀。内网段需要自己加。
+NO_PROXY_LIST="${NETPROXY_NO_PROXY:-localhost,127.0.0.1,::1,.local,10.100.129.13,10.100.129.0}"
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/netproxy"
+PID_FILE="$STATE_DIR/supervisor.pid"
+SSH_PID_FILE="$STATE_DIR/ssh.pid"
+STOP_FILE="$STATE_DIR/stop"
+ENV_FILE="$STATE_DIR/env"
+LOG_FILE="$STATE_DIR/netproxy.log"
+
+SSH_OPTS=(
+  -N
+  -o BatchMode=yes
+  -o ConnectTimeout=8
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=3
+  -o ExitOnForwardFailure=yes
+  -o TCPKeepAlive=yes
+  -o StrictHostKeyChecking=accept-new
+  -o Compression=no
+  -p "$PEER_PORT"
+)
+[ -n "$IDENTITY" ] && SSH_OPTS+=(-i "$IDENTITY")
+
+# ---------------------------------------------------------------- 工具
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE"; }
+say() { printf '%s\n' "$*"; }
+die() { printf 'netproxy: %s\n' "$*" >&2; exit 1; }
+
+port_open() {
+  # 用 bash 的 /dev/tcp；偶发 EADDRINUSE 时重试一次，避免误报"未就绪"
+  local i
+  for i in 1 2 3; do
+    (exec 3<>"/dev/tcp/127.0.0.1/$LOCAL_PORT") 2>/dev/null && return 0
+    sleep 0.2
+  done
+  return 1
+}
+pid_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+read_pid() { [ -r "$1" ] && head -n1 "$1" 2>/dev/null; }
+is_up() { pid_alive "$(read_pid "$PID_FILE")" && port_open; }
+
+host_has_ip() {
+  local want="$1" addrs a
+  addrs="$(hostname -I 2>/dev/null) $(ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+  case " $addrs " in *" $want "*) return 0 ;; esac
+  for a in $(getent ahostsv4 "$want" 2>/dev/null | awk '{print $1}' | sort -u); do
+    case " $addrs " in *" $a "*) return 0 ;; esac
+  done
+  return 1
+}
+
+# 角色判定：本机是不是 B（即 PEER 指向的那台之外的另一端）
+detect_role() {
+  [ "$ROLE" != auto ] && { printf '%s' "$ROLE"; return; }
+  if [ -z "$PEER" ]; then printf 'b'; return; fi
+  if host_has_ip "$PEER"; then printf 'b'; else printf 'a'; fi
+}
+
+wait_port() {
+  local i=0 max=$(( ${1%.*} * 5 ))
+  while [ "$i" -lt "$max" ]; do
+    port_open && return 0
+    sleep 0.2
+    i=$((i + 1))
+  done
+  return 1
+}
+
+write_env() {
+  cat >"$ENV_FILE" <<EOF
+export http_proxy="$PROXY_URL"
+export https_proxy="$PROXY_URL"
+export all_proxy="$PROXY_URL"
+export HTTP_PROXY="$PROXY_URL"
+export HTTPS_PROXY="$PROXY_URL"
+export ALL_PROXY="$PROXY_URL"
+export no_proxy="$NO_PROXY_LIST"
+export NO_PROXY="$NO_PROXY_LIST"
+EOF
+}
+
+peer_ssh_ok() {
+  ssh "${SSH_OPTS[@]}" -o ExitOnForwardFailure=no "$PEER_USER@$PEER" true 2>/dev/null
+}
+
+# ---------------------------------------------------------------- A 侧：反向隧道
+# forward 模式：把 A 本地的代理端口映射到 B 的回环；dynamic 模式：sshd 直接当 SOCKS
+remote_spec() {
+  if [ "$MODE" = dynamic ]; then
+    printf '%s:%s' "$SOCKS_BIND" "$LOCAL_PORT"
+  else
+    printf '%s:%s:127.0.0.1:%s' "$SOCKS_BIND" "$LOCAL_PORT" "$UPSTREAM_PORT"
+  fi
+}
+
+supervise() {
+  trap '[ -n "${ssh_pid:-}" ] && kill "$ssh_pid" 2>/dev/null; exit 0' TERM INT HUP
+  local backoff=2 spec rc
+  spec="$(remote_spec)"
+  while [ ! -e "$STOP_FILE" ]; do
+    log "ssh -R $spec （模式 $MODE）"
+    ssh "${SSH_OPTS[@]}" -R "$spec" "$PEER_USER@$PEER" &
+    ssh_pid=$!
+    printf '%s\n' "$ssh_pid" >"$SSH_PID_FILE"
+    wait "$ssh_pid"
+    rc=$?
+    log "ssh -R: 退出 (rc=$rc)"
+    [ -e "$STOP_FILE" ] && break
+    sleep "$backoff"
+    backoff=$((backoff * 2))
+    [ "$backoff" -gt 60 ] && backoff=60
+  done
+  log "监督进程结束"
+}
+
+cmd_up() {
+  [ "$(detect_role)" = a ] || die "这个命令要在 A 上运行（A 是发起方）。
+  · 本机判定为 B（配置里的对端是 \"$PEER\"）
+  · B 侧只需 netproxy status / netproxy env"
+  [ -n "$PEER" ] || die "未配置 NETPROXY_PEER（B 的地址）。见 netproxy install"
+  mkdir -p "$STATE_DIR"
+  if is_up; then say "已经在运行（127.0.0.1:$LOCAL_PORT）"; return 0; fi
+
+  rm -f "$STOP_FILE"
+  local old; old="$(read_pid "$PID_FILE")"
+  pid_alive "$old" && kill "$old" 2>/dev/null || true
+
+  setsid bash "$0" __supervise >>"$LOG_FILE" 2>&1 </dev/null &
+  printf '%s\n' "$!" >"$PID_FILE"
+
+  # 反向转发建在 B 上，A 看不到端口，只能确认 ssh 会话确实立住了：
+  # 同一个 ssh 进程连续存活 3 秒（而不是进程反复重启）
+  local i=0 last="" stable=0
+  while [ "$i" -lt 24 ]; do
+    local cur; cur="$(read_pid "$SSH_PID_FILE")"
+    if pid_alive "$cur" && [ "$cur" = "$last" ]; then
+      stable=$((stable + 1))
+    else
+      stable=0
+      last="$cur"
+    fi
+    [ "$stable" -ge 12 ] && break
+    sleep 0.25
+    i=$((i + 1))
+  done
+  if [ "$stable" -lt 12 ]; then
+    say "启动失败，最近日志："; tail -n 15 "$LOG_FILE" >&2
+    cmd_down >/dev/null 2>&1
+    return 1
+  fi
+  if [ "$MODE" = dynamic ]; then
+    say "已开启：B 的 $SOCKS_BIND:$LOCAL_PORT 是 sshd 直拨的 SOCKS5（出口经 $PEER_USER@$PEER）"
+  else
+    say "已开启：B 的 $SOCKS_BIND:$LOCAL_PORT  ->  A 的 127.0.0.1:$UPSTREAM_PORT（经 $PEER_USER@$PEER）"
+  fi
+  say "代理地址：$PROXY_URL"
+  say "在 B 上验证： netproxy status ； netproxy env"
+}
+
+cmd_down() {
+  mkdir -p "$STATE_DIR"
+  : >"$STOP_FILE"
+  local sup sshp
+  sup="$(read_pid "$PID_FILE")"; sshp="$(read_pid "$SSH_PID_FILE")"
+  pid_alive "$sshp" && kill "$sshp" 2>/dev/null || true
+  pid_alive "$sup" && kill "$sup" 2>/dev/null || true
+  sleep 0.5
+  pid_alive "$sup" && kill -9 "$sup" 2>/dev/null || true
+  pid_alive "$sshp" && kill -9 "$sshp" 2>/dev/null || true
+  rm -f "$PID_FILE" "$SSH_PID_FILE" "$STOP_FILE" "$ENV_FILE"
+  # 监督进程可能在睡眠中，等它自己看到 stop 文件退出
+  local i=0
+  while [ "$i" -lt 30 ] && pgrep -f "netproxy __supervise" >/dev/null 2>&1; do
+    sleep 0.2; i=$((i + 1))
+  done
+  pkill -f "netproxy __supervise" 2>/dev/null || true
+  rm -f "$STOP_FILE"
+  say "已关闭"
+}
+
+cmd_status() {
+  local role; role="$(detect_role)"
+  local desc="$PROXY_URL ($MODE 模式)"
+  [ "$MODE" = forward ] && desc="$PROXY_URL  ->  upstream :$UPSTREAM_PORT  (forward 模式)"
+  if port_open; then
+    say "状态      : 运行中（本机 $LOCAL_PORT 可连接）"
+    say "代理地址  : $desc"
+    say "启用方式  : eval \"\$(netproxy env)\""
+    return 0
+  fi
+  say "状态      : 未运行（127.0.0.1:$LOCAL_PORT 无监听）"
+  if [ "$role" = a ]; then
+    say "提示      : 你是 A，执行 netproxy up 发起反向隧道"
+  else
+    say "提示      : 你是 B，需要在 A 上执行 netproxy up"
+    [ -z "$PEER" ] || say "A 的地址    : （由你在 A 上配置 NETPROXY_PEER=$PEER）"
+  fi
+  return 1
+}
+
+cmd_env() {
+  port_open || die "代理未就绪（127.0.0.1:$LOCAL_PORT 无监听）；确认 A 上已 netproxy up"
+  write_env
+  cat "$ENV_FILE"
+}
+
+cmd_run() {
+  [ $# -gt 0 ] || die "用法: netproxy run <命令...>"
+  port_open || die "代理未就绪；确认 A 上已 netproxy up"
+  env http_proxy="$PROXY_URL" https_proxy="$PROXY_URL" all_proxy="$PROXY_URL" \
+    HTTP_PROXY="$PROXY_URL" HTTPS_PROXY="$PROXY_URL" ALL_PROXY="$PROXY_URL" \
+    no_proxy="$NO_PROXY_LIST" NO_PROXY="$NO_PROXY_LIST" "$@"
+}
+
+cmd_test() {
+  port_open || die "代理未就绪；确认 A 上已 netproxy up"
+  say "== 本地端口"; say "  $SOCKS_BIND:$LOCAL_PORT 可连接"
+  say "== 上游协议探测"
+  python3 - "$LOCAL_PORT" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+def socks():
+    try:
+        s = socket.create_connection(("127.0.0.1", port), 6)
+        s.sendall(b"\x05\x01\x00")
+        r = s.recv(2); s.close()
+        return r == b"\x05\x00"
+    except Exception:
+        return False
+def http_proxy():
+    try:
+        s = socket.create_connection(("127.0.0.1", port), 6)
+        s.sendall(b"CONNECT www.baidu.com:443 HTTP/1.1\r\nHost: www.baidu.com:443\r\n\r\n")
+        r = s.recv(64); s.close()
+        return b" 200" in r.split(b"\r\n")[0]
+    except Exception:
+        return False
+s_ok, h_ok = socks(), http_proxy()
+print("  SOCKS5 :", "可用" if s_ok else "不可用")
+print("  HTTP   :", "可用" if h_ok else "不可用")
+if s_ok and not h_ok:
+    print("  建议   : NETPROXY_PROXY_SCHEME=socks5h")
+elif h_ok and not s_ok:
+    print("  建议   : NETPROXY_PROXY_SCHEME=http")
+PY
+  say "== 经 A 的出网口访问外网（当前 scheme=$PROXY_SCHEME）"
+  command -v curl >/dev/null || { say "  未安装 curl，跳过"; return 0; }
+  local t rc=0
+  for t in https://www.google.com.hk https://www.baidu.com; do
+    printf '  %-32s ' "$t"
+    if curl -sS -m 25 -o /dev/null -w '%{http_code}\n' -x "$PROXY_URL" "$t" 2>/dev/null; then
+      :
+    else
+      say "失败"; rc=1
+    fi
+  done
+  return "$rc"
+}
+
+cmd_shellinit() {
+  cat <<EOF
+# >>> netproxy >>>
+if [ -x "$HOME/.bin/netproxy" ] && "\$HOME/.bin/netproxy" status >/dev/null 2>&1; then
+  eval "\$("$HOME/.bin/netproxy" env)"
+fi
+# <<< netproxy <<<
+EOF
+}
+
+cmd_install() {
+  mkdir -p "$STATE_DIR" "$(dirname "$CONFIG_FILE")"
+  local role; role="$(detect_role)"
+  cat >"$CONFIG_FILE" <<EOF
+NETPROXY_ROLE=$role
+NETPROXY_PEER=${PEER:-}
+NETPROXY_PEER_USER=$PEER_USER
+NETPROXY_PEER_PORT=$PEER_PORT
+NETPROXY_IDENTITY=$IDENTITY
+NETPROXY_LOCAL_PORT=$LOCAL_PORT
+NETPROXY_SOCKS_BIND=$SOCKS_BIND
+NETPROXY_MODE=$MODE
+NETPROXY_UPSTREAM_PORT=$UPSTREAM_PORT
+NETPROXY_PROXY_SCHEME=$PROXY_SCHEME
+EOF
+  say "已写入 $CONFIG_FILE（角色判定：$role）"
+  [ -n "${PEER:-}" ] || say "记得把 NETPROXY_PEER 设成对端地址"
+  say "A 上： netproxy up     B 上： netproxy status / env"
+}
+
+cmd_version() {
+  say "netproxy $VERSION"
+  say "模式   : $MODE   上游端口: $UPSTREAM_PORT   本地端口: $LOCAL_PORT"
+  say "scheme : $PROXY_SCHEME"
+  say "脚本   : $0"
+  # 旧版没有 MODE 变量，且 up 的输出文案不同——据此判断对端是否更新过
+}
+
+usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+  up)          cmd_up ;;
+  down|off)    cmd_down ;;
+  status)      cmd_status ;;
+  version|-V)  cmd_version ;;
+  env)         cmd_env ;;
+  run)         shift; cmd_run "$@" ;;
+  test)        cmd_test ;;
+  shellinit)   cmd_shellinit ;;
+  install)     cmd_install ;;
+  on)          die "反向模式下开关在 A 上：在 A 执行 netproxy up ；B 侧用 netproxy status 查看" ;;
+  __supervise) supervise ;;
+  ''|-h|--help|help) usage ;;
+  *) die "未知命令: $1（可用: up down status env run test install shellinit）" ;;
+esac
