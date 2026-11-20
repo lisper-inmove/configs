@@ -127,6 +127,51 @@ unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 
 **必须用 `socks5h://`（末尾的 h）** —— B 的 DNS 完全不可用，要靠 A 侧解析域名。
 
+## 让 SSH / git 也走隧道
+
+`http_proxy` 只影响 HTTP(S) 客户端，**对 SSH 无效**。B 又解析不了 `ssh.github.com`，
+所以 `git clone git@github.com:...` / `git push` 会直接报：
+
+```
+ssh: Could not resolve hostname ssh.github.com: Temporary failure in name resolution
+```
+
+解决办法是给 SSH 配一个 ProxyCommand。这里用一个小包装脚本 `~/.ssh/github-proxy`，
+**隧道开着走 SOCKS5，没开则退回直连**（避免忘记开隧道时 SSH 卡死）：
+
+```bash
+#!/usr/bin/env bash
+set -u
+host="${1:?host}"; port="${2:?port}"
+socks="127.0.0.1:${NETPROXY_LOCAL_PORT:-17891}"
+if (exec 3<>"/dev/tcp/${socks%:*}/${socks#*:}") 2>/dev/null; then
+  exec nc -X 5 -x "$socks" "$host" "$port"
+fi
+exec nc "$host" "$port"
+```
+
+然后写进 `~/.ssh/config`（这个文件已入库在本仓库中）：
+
+```
+Host github.com
+  Hostname ssh.github.com
+  Port 443
+  ProxyCommand /home/JC1136/.ssh/github-proxy %h %p
+```
+
+验证：
+
+```bash
+ssh -G github.com | grep proxycommand     # 确认配置生效
+ssh -T git@github.com                     # Hi lisper-inmove! ...
+git ls-remote origin                      # 能列出分支即可
+```
+
+之后 `git push` / `git pull` 不需要再带任何额外参数。
+
+> `nc` 必须是 OpenBSD netcat（支持 `-X 5 -x`）。若换成 nmap-ncat，
+> 参数要改成 `--proxy-type socks5 --proxy 127.0.0.1:17891`。
+
 ## 实测结果（2026-11-20，forward 模式）
 
 ```
@@ -141,6 +186,7 @@ pypi.org             200      npmjs.org       200     api.anthropic   401(正常
 | 稳定性 | google.com.hk 连续 20 次全部 200 |
 | 直连对照 | baidu/google 直连均 000 |
 | `git clone` / `netproxy run` / `eval env` | ✅ |
+| `git push` / `git ls-remote`（SSH remote） | ✅ 通过 ProxyCommand 走隧道 |
 
 `zh.wikipedia.org` 返回 301 是维基自己的语言重定向，不是故障；
 `api.anthropic.com` 的 401 是缺 API key（请求确实到达了服务端）。
@@ -165,15 +211,20 @@ localhost,127.0.0.1,::1,.local,10.100.129.13,10.100.129.0
 
 如果你还要访问别的内网服务，用 `NETPROXY_NO_PROXY` 把它们逐个加上。
 
-**git 的 URL 改写会绕过代理。** B 的 `~/.gitconfig` 里有：
+**git 的 URL 改写会绕过代理。** 如果 `~/.gitconfig` 里有这类配置：
 
 ```
 url.https://ghfast.top/https://github.com/.insteadof = https://github.com/
 ```
 
-github 流量会被改写到镜像站，而镜像站不在代理覆盖范围内。要么临时用干净的
-`HOME`，要么删掉这条改写：
+github 流量会被改写到镜像站，而镜像站不在代理覆盖范围内，表现为
+`gnutls_handshake() failed`。检查并删除：
 
 ```bash
+git config --global --get-regexp 'url\.'          # 先确认有没有
 git config --global --unset url.https://ghfast.top/https://github.com/.insteadOf
 ```
+
+（B 当前已无此配置。）
+
+**SSH 不读 `http_proxy`。** 详见上文「让 SSH / git 也走隧道」。
